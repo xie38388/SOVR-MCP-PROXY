@@ -35,11 +35,11 @@ import { EventEmitter } from 'node:events';
 // Zero-dependency embedded Policy Engine
 // ============================================================================
 
-type Channel = "mcp" | "http" | "sql" | "exec";
-type Verdict = "allow" | "deny" | "escalate";
-type RiskLevel = "none" | "low" | "medium" | "high" | "critical";
+export type Channel = "mcp" | "http" | "sql" | "exec";
+export type Verdict = "allow" | "deny" | "escalate";
+export type RiskLevel = "none" | "low" | "medium" | "high" | "critical";
 
-interface PolicyRule {
+export interface PolicyRule {
   id: string;
   description: string;
   channels: Channel[];
@@ -53,7 +53,18 @@ interface PolicyRule {
   enabled: boolean;
 }
 
-interface EvalResult {
+/** Request payload for the evaluate() function */
+export interface EvalRequest {
+  channel: Channel;
+  action: string;
+  resource: string;
+  context?: McpContext;
+}
+
+/** Context object passed to policy evaluation */
+export type McpContext = Record<string, unknown>;
+
+export interface EvalResult {
   verdict: Verdict;
   risk_score: number;
   matched_rules: string[];
@@ -8158,3 +8169,5 @@ export {
   getProxyTools,
   // McpProxy class and types are exported via `export class` / `export interface` above
 };
+
+export default McpProxy;

@@ -49,6 +49,15 @@ interface PolicyRule {
     priority: number;
     enabled: boolean;
 }
+/** Request payload for the evaluate() function */
+interface EvalRequest {
+    channel: Channel;
+    action: string;
+    resource: string;
+    context?: McpContext;
+}
+/** Context object passed to policy evaluation */
+type McpContext = Record<string, unknown>;
 interface EvalResult {
     verdict: Verdict;
     risk_score: number;
@@ -248,4 +257,4 @@ declare class McpProxy extends EventEmitter {
  */
 declare function proxyCli(args: string[]): Promise<void>;
 
-export { type BlockedCallInfo, type EscalatedCallInfo, type InterceptInfo, McpProxy, type McpProxyConfig, type ProxyStats, type SingleUpstreamConfig, TOOLS, VERSION, auditLog, downstreamServers, evaluate, filterToolsByTier, getProxyTools, handleToolCall, initProxy, main, parseCommand, parseSQL, proxyCli, proxyEnabled, proxyToolCall, proxyToolMap, rules, shutdownProxy, tierHasAccess };
+export { type BlockedCallInfo, type Channel, type EscalatedCallInfo, type EvalRequest, type EvalResult, type InterceptInfo, type McpContext, McpProxy, type McpProxyConfig, type PolicyRule, type ProxyStats, type RiskLevel, type SingleUpstreamConfig, TOOLS, VERSION, type Verdict, auditLog, McpProxy as default, downstreamServers, evaluate, filterToolsByTier, getProxyTools, handleToolCall, initProxy, main, parseCommand, parseSQL, proxyCli, proxyEnabled, proxyToolCall, proxyToolMap, rules, shutdownProxy, tierHasAccess };

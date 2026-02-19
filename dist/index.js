@@ -7546,11 +7546,13 @@ async function proxyCli(args) {
   });
   await proxy.start();
 }
+var index_default = McpProxy;
 export {
   McpProxy,
   TOOLS,
   VERSION,
   auditLog,
+  index_default as default,
   downstreamServers,
   evaluate,
   filterToolsByTier,
