@@ -1,22 +1,34 @@
 {
-  "$schema": "https://sovr.inc/schemas/proxy-config-v1.json",
-  "description": "Example proxy configuration — add your downstream MCP servers here. Replace ALL placeholder values with your real credentials.",
-  "downstream": [
-    {
-      "name": "stripe",
+  "$schema": "https://sovr.inc/schemas/proxy-config-v2.json",
+  "description": "Example proxy configuration — supports stdio, SSE, and Streamable HTTP transports. Replace ALL placeholder values with your real credentials.",
+  "downstream": {
+    "stripe": {
       "command": "npx",
       "args": ["-y", "@stripe/mcp-server"],
       "env": {
         "STRIPE_SECRET_KEY": "sk_test_REPLACE_WITH_YOUR_REAL_KEY"
       }
     },
-    {
-      "name": "github",
+    "github": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": {
         "GITHUB_TOKEN": "ghp_REPLACE_WITH_YOUR_REAL_TOKEN"
       }
+    },
+    "remote-sse-example": {
+      "transport": "sse",
+      "url": "https://mcp.example.com/sse",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_YOUR_TOKEN"
+      }
+    },
+    "remote-http-example": {
+      "transport": "streamable-http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_YOUR_TOKEN"
+      }
     }
-  ]
+  }
 }

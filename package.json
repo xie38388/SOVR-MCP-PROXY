@@ -1,7 +1,7 @@
 {
   "name": "sovr-mcp-proxy",
-  "version": "2.0.1",
-  "description": "Transparent MCP Proxy that intercepts all agent tool calls with policy gate-check before forwarding. Superset of sovr-mcp-server.",
+  "version": "2.1.0",
+  "description": "Transparent MCP Proxy that intercepts all agent tool calls with policy gate-check before forwarding. Supports stdio, SSE, and Streamable HTTP transports. Superset of sovr-mcp-server.",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -13,7 +13,10 @@
     "audit",
     "trust",
     "sovr",
-    "mcp-proxy"
+    "mcp-proxy",
+    "sse",
+    "streamable-http",
+    "remote-mcp"
   ],
   "homepage": "https://sovr.inc",
   "repository": {

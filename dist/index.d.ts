@@ -80,10 +80,16 @@ interface AuditEntry {
 }
 declare let rules: PolicyRule[];
 declare const auditLog: AuditEntry[];
-declare const VERSION = "2.0.0";
+declare const VERSION = "2.1.0";
+type DownstreamTransport = "stdio" | "sse" | "streamable-http";
 interface DownstreamServer {
     name: string;
+    transportType: DownstreamTransport;
     process: ReturnType<typeof node_child_process.spawn> | null;
+    remoteUrl?: string;
+    remoteHeaders?: Record<string, string>;
+    remotePostUrl?: string;
+    sseAbort?: AbortController;
     tools: Array<{
         name: string;
         description?: string;

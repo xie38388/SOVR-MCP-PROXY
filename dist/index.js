@@ -30,7 +30,7 @@ var BUILT_IN_RULES = [
 var rules = BUILT_IN_RULES.map((r) => ({ ...r, conditions: [...r.conditions] }));
 var auditLog = [];
 var MAX_AUDIT = 500;
-var VERSION = "2.0.0";
+var VERSION = "2.1.0";
 var downstreamServers = /* @__PURE__ */ new Map();
 var proxyToolMap = /* @__PURE__ */ new Map();
 var proxyEnabled = false;
@@ -46,14 +46,36 @@ function getProxyConfig() {
   }
 }
 function sendToDownstream(server, message) {
-  if (!server.process?.stdin?.writable) return;
-  const json = JSON.stringify(message);
-  const payload = `Content-Length: ${Buffer.byteLength(json)}\r
+  if (server.transportType === "stdio") {
+    if (!server.process?.stdin?.writable) return;
+    const json = JSON.stringify(message);
+    const payload = `Content-Length: ${Buffer.byteLength(json)}\r
 \r
 ${json}`;
-  server.process.stdin.write(payload);
+    server.process.stdin.write(payload);
+  } else if (server.transportType === "sse") {
+    const postUrl = server.remotePostUrl;
+    if (!postUrl) {
+      log(`[proxy:${server.name}] SSE post URL not yet established`);
+      return;
+    }
+    const json = JSON.stringify(message);
+    fetch(postUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...server.remoteHeaders ?? {} },
+      body: json,
+      signal: AbortSignal.timeout(3e4)
+    }).catch((err) => log(`[proxy:${server.name}] SSE POST error: ${err}`));
+  } else if (server.transportType === "streamable-http") {
+  }
 }
 function requestFromDownstream(server, method, params) {
+  if (server.transportType === "streamable-http") {
+    return requestFromDownstreamHttp(server, method, params);
+  }
+  if (server.transportType === "sse") {
+    return requestFromDownstreamSse(server, method, params);
+  }
   return new Promise((resolve, reject) => {
     const id = server.nextId++;
     const TIMEOUT_MS = 3e4;
@@ -64,6 +86,79 @@ function requestFromDownstream(server, method, params) {
     server.pendingRequests.set(id, { resolve, reject, timer });
     sendToDownstream(server, { jsonrpc: "2.0", id, method, params: params ?? {} });
   });
+}
+function requestFromDownstreamSse(server, method, params) {
+  return new Promise((resolve, reject) => {
+    const id = server.nextId++;
+    const TIMEOUT_MS = 3e4;
+    const timer = setTimeout(() => {
+      server.pendingRequests.delete(id);
+      reject(new Error(`[proxy] Timeout waiting for ${server.name} SSE response to ${method}`));
+    }, TIMEOUT_MS);
+    server.pendingRequests.set(id, { resolve, reject, timer });
+    const postUrl = server.remotePostUrl;
+    if (!postUrl) {
+      clearTimeout(timer);
+      server.pendingRequests.delete(id);
+      reject(new Error(`[proxy:${server.name}] SSE post URL not established`));
+      return;
+    }
+    const json = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
+    fetch(postUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...server.remoteHeaders ?? {} },
+      body: json,
+      signal: AbortSignal.timeout(TIMEOUT_MS)
+    }).catch((err) => {
+      clearTimeout(timer);
+      server.pendingRequests.delete(id);
+      reject(new Error(`[proxy:${server.name}] SSE POST failed: ${err}`));
+    });
+  });
+}
+async function requestFromDownstreamHttp(server, method, params) {
+  const id = server.nextId++;
+  const url = server.remoteUrl;
+  if (!url) throw new Error(`[proxy:${server.name}] No remote URL configured`);
+  const json = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
+  const TIMEOUT_MS = 3e4;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+      ...server.remoteHeaders ?? {}
+    },
+    body: json,
+    signal: AbortSignal.timeout(TIMEOUT_MS)
+  });
+  if (!resp.ok) {
+    throw new Error(`[proxy:${server.name}] HTTP ${resp.status}: ${resp.statusText}`);
+  }
+  const contentType = resp.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const data2 = await resp.json();
+    if (data2.error) throw new Error(data2.error.message ?? "Downstream error");
+    return data2.result;
+  }
+  if (contentType.includes("text/event-stream")) {
+    const text = await resp.text();
+    for (const line of text.split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        const msg = JSON.parse(line.slice(6));
+        if (msg.id === id) {
+          if (msg.error) throw new Error(msg.error.message ?? "Downstream error");
+          return msg.result;
+        }
+      } catch {
+      }
+    }
+    throw new Error(`[proxy:${server.name}] No matching response in SSE stream`);
+  }
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error.message ?? "Downstream error");
+  return data.result;
 }
 function handleDownstreamData(server, chunk) {
   server.buffer += chunk;
@@ -98,10 +193,20 @@ function handleDownstreamData(server, chunk) {
     }
   }
 }
-async function spawnDownstream(name, config) {
-  const { spawn } = __require("child_process");
-  const server = {
+function resolveTransport(config) {
+  if (config.transport) return config.transport;
+  if ("command" in config && config.command) return "stdio";
+  if ("url" in config && config.url) {
+    const u = config.url;
+    if (u.includes("/sse")) return "sse";
+    return "streamable-http";
+  }
+  return "stdio";
+}
+function createDownstreamServer(name, transport) {
+  return {
     name,
+    transportType: transport,
     process: null,
     tools: [],
     ready: false,
@@ -109,6 +214,10 @@ async function spawnDownstream(name, config) {
     pendingRequests: /* @__PURE__ */ new Map(),
     nextId: 1
   };
+}
+async function connectStdioDownstream(name, config) {
+  const { spawn } = __require("child_process");
+  const server = createDownstreamServer(name, "stdio");
   const env = { ...process.env, ...config.env ?? {} };
   delete env.SOVR_PROXY_CONFIG;
   const proc = spawn(config.command, config.args ?? [], {
@@ -133,24 +242,188 @@ async function spawnDownstream(name, config) {
     }
     server.pendingRequests.clear();
   });
+  await initializeMcpHandshake(server);
+  return server;
+}
+async function connectSseDownstream(name, config) {
+  const server = createDownstreamServer(name, "sse");
+  server.remoteUrl = config.url;
+  server.remoteHeaders = { ...config.headers ?? {} };
+  if (config.env) {
+    for (const [k, v] of Object.entries(config.env)) {
+      if (k.toLowerCase().includes("token") || k.toLowerCase().includes("key") || k.toLowerCase().includes("auth")) {
+        if (!server.remoteHeaders["Authorization"]) {
+          server.remoteHeaders["Authorization"] = `Bearer ${v}`;
+        }
+      }
+    }
+  }
+  const abort = new AbortController();
+  server.sseAbort = abort;
+  log(`[proxy:${name}] Connecting to SSE endpoint: ${config.url}`);
+  try {
+    const resp = await fetch(config.url, {
+      method: "GET",
+      headers: {
+        "Accept": "text/event-stream",
+        ...server.remoteHeaders
+      },
+      signal: abort.signal
+    });
+    if (!resp.ok) {
+      throw new Error(`SSE connection failed: HTTP ${resp.status} ${resp.statusText}`);
+    }
+    if (!resp.body) {
+      throw new Error("SSE response has no body");
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuf = "";
+    const readLoop = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            log(`[proxy:${name}] SSE stream ended`);
+            server.ready = false;
+            break;
+          }
+          sseBuf += decoder.decode(value, { stream: true });
+          const events = sseBuf.split("\n\n");
+          sseBuf = events.pop() ?? "";
+          for (const event of events) {
+            if (!event.trim()) continue;
+            let eventType = "message";
+            let eventData = "";
+            for (const line of event.split("\n")) {
+              if (line.startsWith("event: ")) {
+                eventType = line.slice(7).trim();
+              } else if (line.startsWith("data: ")) {
+                eventData += (eventData ? "\n" : "") + line.slice(6);
+              } else if (line.startsWith("data:")) {
+                eventData += (eventData ? "\n" : "") + line.slice(5);
+              }
+            }
+            if (eventType === "endpoint" && eventData) {
+              const endpointUrl = eventData.trim();
+              try {
+                const base = new URL(config.url);
+                server.remotePostUrl = new URL(endpointUrl, base).toString();
+              } catch {
+                server.remotePostUrl = endpointUrl;
+              }
+              log(`[proxy:${name}] SSE message endpoint: ${server.remotePostUrl}`);
+            } else if (eventType === "message" && eventData) {
+              try {
+                const msg = JSON.parse(eventData);
+                if (msg.id !== void 0 && server.pendingRequests.has(msg.id)) {
+                  const pending = server.pendingRequests.get(msg.id);
+                  clearTimeout(pending.timer);
+                  server.pendingRequests.delete(msg.id);
+                  if (msg.error) {
+                    pending.reject(new Error(msg.error.message ?? "Downstream SSE error"));
+                  } else {
+                    pending.resolve(msg.result);
+                  }
+                }
+              } catch {
+                log(`[proxy:${name}] Failed to parse SSE message: ${eventData.substring(0, 200)}`);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        if (!abort.signal.aborted) {
+          log(`[proxy:${name}] SSE read error: ${err}`);
+          server.ready = false;
+        }
+      }
+    };
+    readLoop();
+    const endpointTimeout = 15e3;
+    const startWait = Date.now();
+    while (!server.remotePostUrl && Date.now() - startWait < endpointTimeout) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (!server.remotePostUrl) {
+      throw new Error(`SSE server did not send endpoint URL within ${endpointTimeout}ms`);
+    }
+    await initializeMcpHandshake(server);
+  } catch (err) {
+    log(`[proxy:${name}] SSE connection failed: ${err}`);
+    abort.abort();
+  }
+  return server;
+}
+async function connectHttpDownstream(name, config) {
+  const server = createDownstreamServer(name, "streamable-http");
+  server.remoteUrl = config.url;
+  server.remoteHeaders = { ...config.headers ?? {} };
+  if (config.env) {
+    for (const [k, v] of Object.entries(config.env)) {
+      if (k.toLowerCase().includes("token") || k.toLowerCase().includes("key") || k.toLowerCase().includes("auth")) {
+        if (!server.remoteHeaders["Authorization"]) {
+          server.remoteHeaders["Authorization"] = `Bearer ${v}`;
+        }
+      }
+    }
+  }
+  log(`[proxy:${name}] Connecting to Streamable HTTP endpoint: ${config.url}`);
+  try {
+    await initializeMcpHandshake(server);
+  } catch (err) {
+    log(`[proxy:${name}] Streamable HTTP connection failed: ${err}`);
+  }
+  return server;
+}
+async function initializeMcpHandshake(server) {
   try {
     await requestFromDownstream(server, "initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
       clientInfo: { name: "sovr-proxy", version: VERSION }
     });
-    sendToDownstream(server, { jsonrpc: "2.0", method: "notifications/initialized" });
+    if (server.transportType === "stdio") {
+      sendToDownstream(server, { jsonrpc: "2.0", method: "notifications/initialized" });
+    } else if (server.transportType === "sse" && server.remotePostUrl) {
+      fetch(server.remotePostUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...server.remoteHeaders ?? {} },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })
+      }).catch(() => {
+      });
+    } else if (server.transportType === "streamable-http" && server.remoteUrl) {
+      fetch(server.remoteUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...server.remoteHeaders ?? {} },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })
+      }).catch(() => {
+      });
+    }
     const toolsResult = await requestFromDownstream(server, "tools/list", {});
     server.tools = toolsResult?.tools ?? [];
     server.ready = true;
     for (const tool of server.tools) {
-      proxyToolMap.set(tool.name, name);
+      proxyToolMap.set(tool.name, server.name);
     }
-    log(`[proxy] ${name}: ${server.tools.length} tools discovered`);
+    log(`[proxy] ${server.name}: ${server.tools.length} tools discovered (${server.transportType})`);
   } catch (err) {
-    log(`[proxy] Failed to initialize ${name}: ${err}`);
+    log(`[proxy] Failed to initialize ${server.name}: ${err}`);
   }
-  return server;
+}
+async function connectDownstream(name, config) {
+  const transport = resolveTransport(config);
+  log(`[proxy] Connecting to ${name} via ${transport}...`);
+  switch (transport) {
+    case "stdio":
+      return connectStdioDownstream(name, config);
+    case "sse":
+      return connectSseDownstream(name, config);
+    case "streamable-http":
+      return connectHttpDownstream(name, config);
+    default:
+      throw new Error(`Unknown transport: ${transport}`);
+  }
 }
 async function initProxy() {
   const config = getProxyConfig();
@@ -158,7 +431,7 @@ async function initProxy() {
   proxyEnabled = true;
   log(`[proxy] Initializing transparent interception for ${Object.keys(config.downstream).length} downstream servers...`);
   const results = await Promise.allSettled(
-    Object.entries(config.downstream).map(([name, cfg]) => spawnDownstream(name, cfg))
+    Object.entries(config.downstream).map(([name, cfg]) => connectDownstream(name, cfg))
   );
   for (const result of results) {
     if (result.status === "fulfilled" && result.value.ready) {
@@ -248,10 +521,17 @@ async function proxyToolCall(toolName, args) {
 }
 function shutdownProxy() {
   for (const [name, server] of downstreamServers) {
-    if (server.process) {
-      log(`[proxy] Shutting down ${name}`);
+    log(`[proxy] Shutting down ${name} (${server.transportType})`);
+    if (server.transportType === "stdio" && server.process) {
       server.process.kill("SIGTERM");
+    } else if (server.sseAbort) {
+      server.sseAbort.abort();
     }
+    for (const [, pending] of server.pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(`Downstream ${name} shutting down`));
+    }
+    server.pendingRequests.clear();
   }
   downstreamServers.clear();
   proxyToolMap.clear();
@@ -7172,7 +7452,9 @@ PROXY MODE (transparent interception):
   {
     "downstream": {
       "stripe": { "command": "npx", "args": ["@stripe/agent-toolkit"] },
-      "github": { "command": "npx", "args": ["@modelcontextprotocol/server-github"], "env": { "GITHUB_TOKEN": "..." } }
+      "github": { "command": "npx", "args": ["@modelcontextprotocol/server-github"], "env": { "GITHUB_TOKEN": "..." } },
+      "remote-sse": { "transport": "sse", "url": "https://mcp.example.com/sse", "headers": { "Authorization": "Bearer ..." } },
+      "remote-http": { "transport": "streamable-http", "url": "https://mcp.example.com/mcp", "headers": { "Authorization": "Bearer ..." } }
     }
   }
 

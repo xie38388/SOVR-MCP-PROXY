@@ -111,7 +111,7 @@ const BUILT_IN_RULES: PolicyRule[] = [
 let rules: PolicyRule[] = BUILT_IN_RULES.map((r) => ({ ...r, conditions: [...r.conditions] }));
 const auditLog: AuditEntry[] = [];
 const MAX_AUDIT = 500;
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 
 // ============================================================================
 // MCP Proxy — Transparent Interception Layer
@@ -122,11 +122,29 @@ const VERSION = "2.0.0";
 // Agent cannot bypass SOVR. Agent doesn't even know SOVR is there.
 // ============================================================================
 
-interface DownstreamConfig {
-  command: string;
-  args?: string[];
+type DownstreamTransport = "stdio" | "sse" | "streamable-http";
+
+interface DownstreamConfigBase {
+  /** Transport type. Defaults to "stdio" if command is present, otherwise inferred from url. */
+  transport?: DownstreamTransport;
   env?: Record<string, string>;
 }
+
+interface StdioDownstreamConfig extends DownstreamConfigBase {
+  transport?: "stdio";
+  command: string;
+  args?: string[];
+}
+
+interface RemoteDownstreamConfig extends DownstreamConfigBase {
+  transport: "sse" | "streamable-http";
+  /** Remote MCP server URL (e.g. https://mcp.example.com/sse) */
+  url: string;
+  /** HTTP headers for authentication (e.g. Authorization: Bearer ...) */
+  headers?: Record<string, string>;
+}
+
+type DownstreamConfig = StdioDownstreamConfig | RemoteDownstreamConfig;
 
 interface ProxyConfig {
   downstream: Record<string, DownstreamConfig>;
@@ -134,7 +152,15 @@ interface ProxyConfig {
 
 interface DownstreamServer {
   name: string;
+  transportType: DownstreamTransport;
+  // stdio fields
   process: ReturnType<typeof import("node:child_process").spawn> | null;
+  // remote fields
+  remoteUrl?: string;
+  remoteHeaders?: Record<string, string>;
+  remotePostUrl?: string; // SSE: the endpoint URL returned by the SSE server for sending messages
+  sseAbort?: AbortController;
+  // common
   tools: Array<{ name: string; description?: string; inputSchema?: unknown }>;
   ready: boolean;
   buffer: string;
@@ -160,13 +186,36 @@ function getProxyConfig(): ProxyConfig | null {
 }
 
 function sendToDownstream(server: DownstreamServer, message: unknown): void {
-  if (!server.process?.stdin?.writable) return;
-  const json = JSON.stringify(message);
-  const payload = `Content-Length: ${Buffer.byteLength(json)}\r\n\r\n${json}`;
-  server.process.stdin.write(payload);
+  if (server.transportType === "stdio") {
+    if (!server.process?.stdin?.writable) return;
+    const json = JSON.stringify(message);
+    const payload = `Content-Length: ${Buffer.byteLength(json)}\r\n\r\n${json}`;
+    server.process.stdin.write(payload);
+  } else if (server.transportType === "sse") {
+    // SSE: POST JSON-RPC message to the server's message endpoint
+    const postUrl = server.remotePostUrl;
+    if (!postUrl) { log(`[proxy:${server.name}] SSE post URL not yet established`); return; }
+    const json = JSON.stringify(message);
+    fetch(postUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(server.remoteHeaders ?? {}) },
+      body: json,
+      signal: AbortSignal.timeout(30_000),
+    }).catch((err) => log(`[proxy:${server.name}] SSE POST error: ${err}`));
+  } else if (server.transportType === "streamable-http") {
+    // Streamable HTTP: POST JSON-RPC message, response comes back in the POST response
+    // Handled in requestFromDownstreamHttp
+  }
 }
 
 function requestFromDownstream(server: DownstreamServer, method: string, params?: unknown): Promise<unknown> {
+  if (server.transportType === "streamable-http") {
+    return requestFromDownstreamHttp(server, method, params);
+  }
+  if (server.transportType === "sse") {
+    return requestFromDownstreamSse(server, method, params);
+  }
+  // stdio: use pending requests map
   return new Promise((resolve, reject) => {
     const id = server.nextId++;
     const TIMEOUT_MS = 30_000;
@@ -177,6 +226,95 @@ function requestFromDownstream(server: DownstreamServer, method: string, params?
     server.pendingRequests.set(id, { resolve, reject, timer });
     sendToDownstream(server, { jsonrpc: "2.0", id, method, params: params ?? {} });
   });
+}
+
+/** SSE transport: POST JSON-RPC and wait for response via SSE event stream */
+function requestFromDownstreamSse(server: DownstreamServer, method: string, params?: unknown): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const id = server.nextId++;
+    const TIMEOUT_MS = 30_000;
+    const timer = setTimeout(() => {
+      server.pendingRequests.delete(id);
+      reject(new Error(`[proxy] Timeout waiting for ${server.name} SSE response to ${method}`));
+    }, TIMEOUT_MS);
+    server.pendingRequests.set(id, { resolve, reject, timer });
+
+    const postUrl = server.remotePostUrl;
+    if (!postUrl) {
+      clearTimeout(timer);
+      server.pendingRequests.delete(id);
+      reject(new Error(`[proxy:${server.name}] SSE post URL not established`));
+      return;
+    }
+
+    const json = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
+    fetch(postUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(server.remoteHeaders ?? {}) },
+      body: json,
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    }).catch((err) => {
+      clearTimeout(timer);
+      server.pendingRequests.delete(id);
+      reject(new Error(`[proxy:${server.name}] SSE POST failed: ${err}`));
+    });
+  });
+}
+
+/** Streamable HTTP transport: POST JSON-RPC and read response from POST body */
+async function requestFromDownstreamHttp(server: DownstreamServer, method: string, params?: unknown): Promise<unknown> {
+  const id = server.nextId++;
+  const url = server.remoteUrl;
+  if (!url) throw new Error(`[proxy:${server.name}] No remote URL configured`);
+
+  const json = JSON.stringify({ jsonrpc: "2.0", id, method, params: params ?? {} });
+  const TIMEOUT_MS = 30_000;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+      ...(server.remoteHeaders ?? {}),
+    },
+    body: json,
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+
+  if (!resp.ok) {
+    throw new Error(`[proxy:${server.name}] HTTP ${resp.status}: ${resp.statusText}`);
+  }
+
+  const contentType = resp.headers.get("content-type") ?? "";
+
+  // If server responds with JSON directly
+  if (contentType.includes("application/json")) {
+    const data = await resp.json() as { result?: unknown; error?: { message: string } };
+    if (data.error) throw new Error(data.error.message ?? "Downstream error");
+    return data.result;
+  }
+
+  // If server responds with SSE stream (Streamable HTTP spec)
+  if (contentType.includes("text/event-stream")) {
+    const text = await resp.text();
+    // Parse SSE events to find the JSON-RPC response
+    for (const line of text.split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        const msg = JSON.parse(line.slice(6));
+        if (msg.id === id) {
+          if (msg.error) throw new Error(msg.error.message ?? "Downstream error");
+          return msg.result;
+        }
+      } catch { /* skip non-JSON data lines */ }
+    }
+    throw new Error(`[proxy:${server.name}] No matching response in SSE stream`);
+  }
+
+  // Fallback: try to parse as JSON
+  const data = await resp.json() as { result?: unknown; error?: { message: string } };
+  if (data.error) throw new Error(data.error.message ?? "Downstream error");
+  return data.result;
 }
 
 function handleDownstreamData(server: DownstreamServer, chunk: string): void {
@@ -210,10 +348,24 @@ function handleDownstreamData(server: DownstreamServer, chunk: string): void {
   }
 }
 
-async function spawnDownstream(name: string, config: DownstreamConfig): Promise<DownstreamServer> {
-  const { spawn } = require("node:child_process") as typeof import("node:child_process");
-  const server: DownstreamServer = {
+/** Resolve transport type from config */
+function resolveTransport(config: DownstreamConfig): DownstreamTransport {
+  if (config.transport) return config.transport;
+  if ("command" in config && config.command) return "stdio";
+  if ("url" in config && (config as unknown as RemoteDownstreamConfig).url) {
+    // Auto-detect: if URL ends with /sse or contains /sse, assume SSE
+    const u = (config as unknown as RemoteDownstreamConfig).url;
+    if (u.includes("/sse")) return "sse";
+    return "streamable-http";
+  }
+  return "stdio";
+}
+
+/** Create a new DownstreamServer shell (not yet connected) */
+function createDownstreamServer(name: string, transport: DownstreamTransport): DownstreamServer {
+  return {
     name,
+    transportType: transport,
     process: null,
     tools: [],
     ready: false,
@@ -221,6 +373,12 @@ async function spawnDownstream(name: string, config: DownstreamConfig): Promise<
     pendingRequests: new Map(),
     nextId: 1,
   };
+}
+
+/** Connect to a downstream MCP server via stdio (spawn process) */
+async function connectStdioDownstream(name: string, config: StdioDownstreamConfig): Promise<DownstreamServer> {
+  const { spawn } = require("node:child_process") as typeof import("node:child_process");
+  const server = createDownstreamServer(name, "stdio");
 
   const env = { ...process.env, ...(config.env ?? {}) };
   // Remove SOVR proxy vars to prevent infinite recursion
@@ -244,7 +402,6 @@ async function spawnDownstream(name: string, config: DownstreamConfig): Promise<
   proc.on("exit", (code: number | null) => {
     log(`[proxy] Downstream ${name} exited with code ${code}`);
     server.ready = false;
-    // Reject all pending requests
     for (const [, pending] of server.pendingRequests) {
       clearTimeout(pending.timer);
       pending.reject(new Error(`Downstream ${name} process exited`));
@@ -252,15 +409,201 @@ async function spawnDownstream(name: string, config: DownstreamConfig): Promise<
     server.pendingRequests.clear();
   });
 
-  // Initialize MCP handshake
+  await initializeMcpHandshake(server);
+  return server;
+}
+
+/** Connect to a downstream MCP server via SSE (Server-Sent Events) */
+async function connectSseDownstream(name: string, config: RemoteDownstreamConfig): Promise<DownstreamServer> {
+  const server = createDownstreamServer(name, "sse");
+  server.remoteUrl = config.url;
+  server.remoteHeaders = { ...(config.headers ?? {}) };
+
+  // Merge env vars as headers if they look like auth tokens
+  if (config.env) {
+    for (const [k, v] of Object.entries(config.env)) {
+      if (k.toLowerCase().includes("token") || k.toLowerCase().includes("key") || k.toLowerCase().includes("auth")) {
+        if (!server.remoteHeaders["Authorization"]) {
+          server.remoteHeaders["Authorization"] = `Bearer ${v}`;
+        }
+      }
+    }
+  }
+
+  // Connect to SSE endpoint
+  const abort = new AbortController();
+  server.sseAbort = abort;
+
+  log(`[proxy:${name}] Connecting to SSE endpoint: ${config.url}`);
+
+  try {
+    const resp = await fetch(config.url, {
+      method: "GET",
+      headers: {
+        "Accept": "text/event-stream",
+        ...server.remoteHeaders,
+      },
+      signal: abort.signal,
+    });
+
+    if (!resp.ok) {
+      throw new Error(`SSE connection failed: HTTP ${resp.status} ${resp.statusText}`);
+    }
+
+    if (!resp.body) {
+      throw new Error("SSE response has no body");
+    }
+
+    // Read SSE stream in background
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuf = "";
+
+    const readLoop = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            log(`[proxy:${name}] SSE stream ended`);
+            server.ready = false;
+            break;
+          }
+          sseBuf += decoder.decode(value, { stream: true });
+
+          // Parse SSE events
+          const events = sseBuf.split("\n\n");
+          sseBuf = events.pop() ?? ""; // Keep incomplete event
+
+          for (const event of events) {
+            if (!event.trim()) continue;
+            let eventType = "message";
+            let eventData = "";
+
+            for (const line of event.split("\n")) {
+              if (line.startsWith("event: ")) {
+                eventType = line.slice(7).trim();
+              } else if (line.startsWith("data: ")) {
+                eventData += (eventData ? "\n" : "") + line.slice(6);
+              } else if (line.startsWith("data:")) {
+                eventData += (eventData ? "\n" : "") + line.slice(5);
+              }
+            }
+
+            if (eventType === "endpoint" && eventData) {
+              // MCP SSE protocol: server sends endpoint URL for posting messages
+              const endpointUrl = eventData.trim();
+              // Resolve relative URLs against the SSE base URL
+              try {
+                const base = new URL(config.url);
+                server.remotePostUrl = new URL(endpointUrl, base).toString();
+              } catch {
+                server.remotePostUrl = endpointUrl;
+              }
+              log(`[proxy:${name}] SSE message endpoint: ${server.remotePostUrl}`);
+            } else if (eventType === "message" && eventData) {
+              // JSON-RPC response from server
+              try {
+                const msg = JSON.parse(eventData);
+                if (msg.id !== undefined && server.pendingRequests.has(msg.id)) {
+                  const pending = server.pendingRequests.get(msg.id)!;
+                  clearTimeout(pending.timer);
+                  server.pendingRequests.delete(msg.id);
+                  if (msg.error) {
+                    pending.reject(new Error(msg.error.message ?? "Downstream SSE error"));
+                  } else {
+                    pending.resolve(msg.result);
+                  }
+                }
+              } catch {
+                log(`[proxy:${name}] Failed to parse SSE message: ${eventData.substring(0, 200)}`);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        if (!abort.signal.aborted) {
+          log(`[proxy:${name}] SSE read error: ${err}`);
+          server.ready = false;
+        }
+      }
+    };
+
+    // Start reading in background (don't await)
+    readLoop();
+
+    // Wait for endpoint URL to be received (with timeout)
+    const endpointTimeout = 15_000;
+    const startWait = Date.now();
+    while (!server.remotePostUrl && Date.now() - startWait < endpointTimeout) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    if (!server.remotePostUrl) {
+      throw new Error(`SSE server did not send endpoint URL within ${endpointTimeout}ms`);
+    }
+
+    await initializeMcpHandshake(server);
+  } catch (err) {
+    log(`[proxy:${name}] SSE connection failed: ${err}`);
+    abort.abort();
+  }
+
+  return server;
+}
+
+/** Connect to a downstream MCP server via Streamable HTTP */
+async function connectHttpDownstream(name: string, config: RemoteDownstreamConfig): Promise<DownstreamServer> {
+  const server = createDownstreamServer(name, "streamable-http");
+  server.remoteUrl = config.url;
+  server.remoteHeaders = { ...(config.headers ?? {}) };
+
+  // Merge env vars as headers if they look like auth tokens
+  if (config.env) {
+    for (const [k, v] of Object.entries(config.env)) {
+      if (k.toLowerCase().includes("token") || k.toLowerCase().includes("key") || k.toLowerCase().includes("auth")) {
+        if (!server.remoteHeaders["Authorization"]) {
+          server.remoteHeaders["Authorization"] = `Bearer ${v}`;
+        }
+      }
+    }
+  }
+
+  log(`[proxy:${name}] Connecting to Streamable HTTP endpoint: ${config.url}`);
+
+  try {
+    await initializeMcpHandshake(server);
+  } catch (err) {
+    log(`[proxy:${name}] Streamable HTTP connection failed: ${err}`);
+  }
+
+  return server;
+}
+
+/** Common MCP handshake: initialize → notifications/initialized → tools/list */
+async function initializeMcpHandshake(server: DownstreamServer): Promise<void> {
   try {
     await requestFromDownstream(server, "initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
       clientInfo: { name: "sovr-proxy", version: VERSION },
     });
-    // Send initialized notification (no response expected)
-    sendToDownstream(server, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+    // Send initialized notification
+    if (server.transportType === "stdio") {
+      sendToDownstream(server, { jsonrpc: "2.0", method: "notifications/initialized" });
+    } else if (server.transportType === "sse" && server.remotePostUrl) {
+      fetch(server.remotePostUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(server.remoteHeaders ?? {}) },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      }).catch(() => {});
+    } else if (server.transportType === "streamable-http" && server.remoteUrl) {
+      fetch(server.remoteUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(server.remoteHeaders ?? {}) },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      }).catch(() => {});
+    }
 
     // Discover tools
     const toolsResult = (await requestFromDownstream(server, "tools/list", {})) as { tools?: Array<{ name: string; description?: string; inputSchema?: unknown }> };
@@ -269,15 +612,29 @@ async function spawnDownstream(name: string, config: DownstreamConfig): Promise<
 
     // Register tool → server mapping
     for (const tool of server.tools) {
-      proxyToolMap.set(tool.name, name);
+      proxyToolMap.set(tool.name, server.name);
     }
 
-    log(`[proxy] ${name}: ${server.tools.length} tools discovered`);
+    log(`[proxy] ${server.name}: ${server.tools.length} tools discovered (${server.transportType})`);
   } catch (err) {
-    log(`[proxy] Failed to initialize ${name}: ${err}`);
+    log(`[proxy] Failed to initialize ${server.name}: ${err}`);
   }
+}
 
-  return server;
+/** Connect to a downstream server based on its transport type */
+async function connectDownstream(name: string, config: DownstreamConfig): Promise<DownstreamServer> {
+  const transport = resolveTransport(config);
+  log(`[proxy] Connecting to ${name} via ${transport}...`);
+  switch (transport) {
+    case "stdio":
+      return connectStdioDownstream(name, config as StdioDownstreamConfig);
+    case "sse":
+      return connectSseDownstream(name, config as RemoteDownstreamConfig);
+    case "streamable-http":
+      return connectHttpDownstream(name, config as RemoteDownstreamConfig);
+    default:
+      throw new Error(`Unknown transport: ${transport}`);
+  }
 }
 
 async function initProxy(): Promise<void> {
@@ -288,7 +645,7 @@ async function initProxy(): Promise<void> {
   log(`[proxy] Initializing transparent interception for ${Object.keys(config.downstream).length} downstream servers...`);
 
   const results = await Promise.allSettled(
-    Object.entries(config.downstream).map(([name, cfg]) => spawnDownstream(name, cfg))
+    Object.entries(config.downstream).map(([name, cfg]) => connectDownstream(name, cfg))
   );
 
   for (const result of results) {
@@ -392,10 +749,18 @@ async function proxyToolCall(toolName: string, args: Record<string, unknown>): P
 
 function shutdownProxy(): void {
   for (const [name, server] of downstreamServers) {
-    if (server.process) {
-      log(`[proxy] Shutting down ${name}`);
+    log(`[proxy] Shutting down ${name} (${server.transportType})`);
+    if (server.transportType === "stdio" && server.process) {
       server.process.kill("SIGTERM");
+    } else if (server.sseAbort) {
+      server.sseAbort.abort();
     }
+    // Reject all pending requests
+    for (const [, pending] of server.pendingRequests) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(`Downstream ${name} shutting down`));
+    }
+    server.pendingRequests.clear();
   }
   downstreamServers.clear();
   proxyToolMap.clear();
@@ -7605,7 +7970,9 @@ PROXY MODE (transparent interception):
   {
     "downstream": {
       "stripe": { "command": "npx", "args": ["@stripe/agent-toolkit"] },
-      "github": { "command": "npx", "args": ["@modelcontextprotocol/server-github"], "env": { "GITHUB_TOKEN": "..." } }
+      "github": { "command": "npx", "args": ["@modelcontextprotocol/server-github"], "env": { "GITHUB_TOKEN": "..." } },
+      "remote-sse": { "transport": "sse", "url": "https://mcp.example.com/sse", "headers": { "Authorization": "Bearer ..." } },
+      "remote-http": { "transport": "streamable-http", "url": "https://mcp.example.com/mcp", "headers": { "Authorization": "Bearer ..." } }
     }
   }
 
