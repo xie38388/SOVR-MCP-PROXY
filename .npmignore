@@ -1,0 +1,12 @@
+src/
+tsconfig.json
+tsup.config.ts
+PUBLISHING.md
+INTEGRATION-TESTING.md
+*.test.ts
+*.spec.ts
+*.test.mjs
+test-*.mjs
+tests/
+.env*
+node_modules/

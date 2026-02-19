@@ -1,0 +1,22 @@
+{
+  "$schema": "https://sovr.inc/schemas/proxy-config-v1.json",
+  "description": "Example proxy configuration — add your downstream MCP servers here. Replace ALL placeholder values with your real credentials.",
+  "downstream": [
+    {
+      "name": "stripe",
+      "command": "npx",
+      "args": ["-y", "@stripe/mcp-server"],
+      "env": {
+        "STRIPE_SECRET_KEY": "sk_test_REPLACE_WITH_YOUR_REAL_KEY"
+      }
+    },
+    {
+      "name": "github",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "ghp_REPLACE_WITH_YOUR_REAL_TOKEN"
+      }
+    }
+  ]
+}

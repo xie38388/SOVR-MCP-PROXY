@@ -1,0 +1,50 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.xie38388/sovr-proxy",
+  "description": "Transparent MCP Proxy — intercepts agent tool calls with policy gate-check before forwarding.",
+  "repository": {
+    "url": "https://github.com/xie38388/SOVR-MCP-PROXY",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "sovr-mcp-proxy",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "SOVR Cloud API key for full SDK access (286 tools). Without this, runs in free local mode with 15 built-in rules.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true,
+          "name": "SOVR_API_KEY"
+        },
+        {
+          "description": "Custom SOVR Cloud endpoint URL. Defaults to https://sovr.inc if SOVR_API_KEY is set.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "SOVR_ENDPOINT"
+        },
+        {
+          "description": "Path to custom policy rules JSON file. Extends the 15 built-in rules with your own.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "SOVR_RULES_FILE"
+        },
+        {
+          "description": "Path to proxy configuration JSON file. Enables transparent MCP Proxy mode to intercept downstream servers.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "SOVR_PROXY_CONFIG"
+        }
+      ]
+    }
+  ]
+}

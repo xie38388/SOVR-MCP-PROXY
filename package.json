@@ -1,0 +1,55 @@
+{
+  "name": "sovr-mcp-proxy",
+  "version": "1.0.0",
+  "description": "Transparent MCP Proxy that intercepts all agent tool calls with policy gate-check before forwarding. Superset of sovr-mcp-server.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai-safety",
+    "ai-governance",
+    "execution-firewall",
+    "proxy",
+    "gate-check",
+    "audit",
+    "trust",
+    "sovr",
+    "mcp-proxy"
+  ],
+  "homepage": "https://sovr.inc",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xie38388/SOVR-MCP-PROXY.git"
+  },
+  "license": "BSL-1.1",
+  "author": "SOVR AI <contact@sovrapp.com>",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "sovr-mcp-proxy": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "server.json"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build",
+    "typecheck": "tsc --noEmit"
+  },
+  "mcpName": "io.github.xie38388/sovr-proxy",
+  "devDependencies": {
+    "tsup": "^8.5.1",
+    "tsx": "^4.0.0",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

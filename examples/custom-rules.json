@@ -1,0 +1,38 @@
+{
+  "$schema": "https://sovr.inc/schemas/rules-v1.json",
+  "name": "Custom Rules Example",
+  "description": "Example custom rules — copy and modify for your use case.",
+  "version": "1.0.0",
+  "rules": [
+    {
+      "id": "block-prod-writes",
+      "description": "Block all writes to production database",
+      "channels": ["sql"],
+      "action_pattern": "INSERT|UPDATE|DELETE|DROP",
+      "resource_pattern": "prod_*",
+      "effect": "deny",
+      "risk_level": "critical",
+      "priority": 100
+    },
+    {
+      "id": "escalate-payments",
+      "description": "Require human approval for payment operations",
+      "channels": ["mcp", "http"],
+      "action_pattern": "*payment*|*charge*|*refund*",
+      "resource_pattern": "*stripe*|*paypal*",
+      "effect": "escalate",
+      "risk_level": "high",
+      "priority": 90
+    },
+    {
+      "id": "block-destructive-git",
+      "description": "Block force-push and branch deletion",
+      "channels": ["exec"],
+      "action_pattern": "*git*push*--force*|*git*branch*-D*|*git*branch*-d*",
+      "resource_pattern": "*",
+      "effect": "deny",
+      "risk_level": "high",
+      "priority": 85
+    }
+  ]
+}
