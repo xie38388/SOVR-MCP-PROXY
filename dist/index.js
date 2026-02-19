@@ -7,6 +7,9 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
 });
 
 // src/index.ts
+import { spawn as nodeSpawn } from "child_process";
+import { createInterface } from "readline";
+import { EventEmitter } from "events";
 var BUILT_IN_RULES = [
   { id: "exec-destructive-commands", description: "Block destructive shell commands (rm -rf, mkfs, dd, shred)", channels: ["exec"], action_pattern: "rm|mkfs|dd|shred|wipefs", resource_pattern: "*", conditions: [], effect: "deny", risk_level: "critical", require_approval: true, priority: 100, enabled: true },
   { id: "exec-kubernetes-destructive", description: "Escalate destructive Kubernetes operations", channels: ["exec"], action_pattern: "kubectl_delete|kubectl_drain|kubectl_cordon", resource_pattern: "*", conditions: [], effect: "escalate", risk_level: "high", require_approval: true, priority: 90, enabled: true },
@@ -27,7 +30,7 @@ var BUILT_IN_RULES = [
 var rules = BUILT_IN_RULES.map((r) => ({ ...r, conditions: [...r.conditions] }));
 var auditLog = [];
 var MAX_AUDIT = 500;
-var VERSION = "6.0.0";
+var VERSION = "2.0.0";
 var downstreamServers = /* @__PURE__ */ new Map();
 var proxyToolMap = /* @__PURE__ */ new Map();
 var proxyEnabled = false;
@@ -396,11 +399,11 @@ async function verifyKeyTier() {
       return "free";
     }
     const data = await resp.json();
-    const tier = (data.tier || data.plan || "free").toLowerCase();
+    const rawTier = (data.tier || data.plan || "free").toLowerCase();
     const validTiers = ["free", "personal", "starter", "pro", "enterprise"];
-    if (validTiers.includes(tier)) return tier;
-    if (tier === "basic" || tier === "individual") return "personal";
-    if (tier === "team" || tier === "business") return "pro";
+    if (validTiers.includes(rawTier)) return rawTier;
+    if (rawTier === "basic" || rawTier === "individual") return "personal";
+    if (rawTier === "team" || rawTier === "business") return "pro";
     return "personal";
   } catch (err) {
     log(`[tier] Cloud verification error: ${err instanceof Error ? err.message : String(err)}`);
@@ -7121,13 +7124,12 @@ function startStdioTransport() {
 async function main() {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     console.log(`
-sovr-mcp-server v${VERSION} \u2014 Full SDK Coverage Edition
-
-The complete MCP interface for the SOVR Responsibility Layer.
-286 tools covering ALL SOVR SDK methods.
+sovr-mcp-proxy v${VERSION} \u2014 Execution Firewall for AI Agents
+The complete MCP interface + programmable proxy for the SOVR Responsibility Layer.
+286 tools + McpProxy class for custom integrations.
 
 USAGE:
-  npx sovr-mcp-server
+  npx sovr-mcp-proxy
 
 ENVIRONMENT:
   SOVR_API_KEY        Connect to SOVR Cloud for full SDK access
@@ -7137,7 +7139,7 @@ ENVIRONMENT:
 LOCAL MODE (free, 15 built-in rules):
   {
     "mcpServers": {
-      "sovr": { "command": "npx", "args": ["sovr-mcp-server"] }
+      "sovr": { "command": "npx", "args": ["sovr-mcp-proxy"] }
     }
   }
 
@@ -7146,7 +7148,7 @@ CLOUD MODE (286 tools, full SDK):
     "mcpServers": {
       "sovr": {
         "command": "npx",
-        "args": ["sovr-mcp-server"],
+        "args": ["sovr-mcp-proxy"],
         "env": { "SOVR_API_KEY": "sovr_sk_..." }
       }
     }
@@ -7157,7 +7159,7 @@ PROXY MODE (transparent interception):
     "mcpServers": {
       "sovr": {
         "command": "npx",
-        "args": ["sovr-mcp-server"],
+        "args": ["sovr-mcp-proxy"],
         "env": {
           "SOVR_API_KEY": "sovr_sk_...",
           "SOVR_PROXY_CONFIG": "/path/to/proxy.json"
@@ -7173,6 +7175,18 @@ PROXY MODE (transparent interception):
       "github": { "command": "npx", "args": ["@modelcontextprotocol/server-github"], "env": { "GITHUB_TOKEN": "..." } }
     }
   }
+
+SINGLE UPSTREAM PROXY MODE (programmable):
+  sovr-mcp-proxy --upstream "npx -y @modelcontextprotocol/server-filesystem /tmp"
+  sovr-mcp-proxy --upstream "node my-server.js" --rules ./policy.json --verbose
+
+PROGRAMMATIC API:
+  import { McpProxy } from 'sovr-mcp-proxy';
+  const proxy = new McpProxy({
+    upstream: { command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/tmp'] },
+    onBlocked: (info) => console.log('Blocked:', info.toolName),
+  });
+  await proxy.start();
 
 Learn more: https://sovr.inc
 `);
@@ -7227,11 +7241,313 @@ Learn more: https://sovr.inc
     startStdioTransport();
   }
 }
-var isMain = typeof process !== "undefined" && process.argv[1] && (process.argv[1].includes("sovr-mcp-server") || process.argv[1].endsWith("index.js") || process.argv[1].endsWith("index.mjs") || process.argv[1].endsWith("index.cjs"));
+var isMain = typeof process !== "undefined" && process.argv[1] && (process.argv[1].includes("sovr-mcp-server") || process.argv[1].includes("sovr-mcp-proxy") || process.argv[1].endsWith("index.js") || process.argv[1].endsWith("index.mjs") || process.argv[1].endsWith("index.cjs"));
 if (isMain) {
-  main();
+  if (process.argv.includes("--upstream") || process.argv.includes("-u")) {
+    proxyCli(process.argv.slice(2));
+  } else {
+    main();
+  }
+}
+var McpProxy = class extends EventEmitter {
+  upstreamConfig;
+  upstream = null;
+  _serverName;
+  _verbose;
+  _onBlocked;
+  _onEscalated;
+  _onIntercept;
+  _stats;
+  _customRules;
+  constructor(config) {
+    super();
+    this.upstreamConfig = config.upstream;
+    this._serverName = config.serverName ?? "sovr-mcp-proxy";
+    this._verbose = config.verbose ?? false;
+    this._onBlocked = config.onBlocked;
+    this._onEscalated = config.onEscalated;
+    this._onIntercept = config.onIntercept;
+    this._customRules = config.customRules ?? [];
+    this._stats = {
+      totalCalls: 0,
+      allowedCalls: 0,
+      blockedCalls: 0,
+      escalatedCalls: 0,
+      upstreamErrors: 0,
+      startedAt: Date.now()
+    };
+    if (this._customRules.length > 0) {
+      for (const r of this._customRules) {
+        rules.push({ ...r, conditions: [...r.conditions || []], enabled: true });
+      }
+    }
+  }
+  /**
+   * Start the proxy in stdio mode.
+   * Reads JSON-RPC messages from stdin, intercepts tool calls,
+   * and forwards approved calls to the upstream MCP server.
+   */
+  async start() {
+    this.upstream = nodeSpawn(
+      this.upstreamConfig.command,
+      this.upstreamConfig.args ?? [],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, ...this.upstreamConfig.env },
+        cwd: this.upstreamConfig.cwd
+      }
+    );
+    if (!this.upstream.stdout || !this.upstream.stdin) {
+      throw new Error("Failed to spawn upstream MCP server");
+    }
+    const upstreamReader = createInterface({ input: this.upstream.stdout });
+    upstreamReader.on("line", (line) => {
+      this.handleUpstreamMessage(line);
+    });
+    this.upstream.stderr?.on("data", (data) => {
+      if (this._verbose) {
+        process.stderr.write(`[sovr-mcp-proxy] upstream stderr: ${data}`);
+      }
+    });
+    this.upstream.on("exit", (code) => {
+      if (this._verbose) {
+        process.stderr.write(`[sovr-mcp-proxy] upstream exited with code ${code}
+`);
+      }
+      this.emit("upstream-exit", code);
+    });
+    const agentReader = createInterface({ input: process.stdin });
+    agentReader.on("line", (line) => {
+      this.handleAgentMessage(line);
+    });
+    process.stdin.on("end", () => {
+      this.stop();
+    });
+    if (this._verbose) {
+      process.stderr.write(`[sovr-mcp-proxy] started, proxying to ${this.upstreamConfig.command}
+`);
+    }
+  }
+  /** Stop the proxy and kill the upstream process. */
+  stop() {
+    if (this.upstream) {
+      this.upstream.kill();
+      this.upstream = null;
+    }
+  }
+  /** Get proxy statistics. */
+  getStats() {
+    return { ...this._stats };
+  }
+  // ---------- Internal ----------
+  handleAgentMessage(line) {
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      this.forwardToUpstream(line);
+      return;
+    }
+    if (msg.method === "tools/call") {
+      this.interceptToolCall(msg);
+    } else {
+      this.forwardToUpstream(line);
+    }
+  }
+  handleUpstreamMessage(line) {
+    process.stdout.write(line + "\n");
+  }
+  interceptToolCall(request) {
+    this._stats.totalCalls++;
+    const params = request.params ?? {};
+    const toolName = params.name ?? "unknown";
+    const toolArgs = params.arguments ?? {};
+    const dangerSignals = this.extractDangerSignals(toolName, toolArgs);
+    const decision = evaluate("mcp", toolName, toolName, {
+      tool_name: toolName,
+      server_name: this._serverName,
+      arguments: toolArgs,
+      ...dangerSignals
+    });
+    const interceptInfo = {
+      method: request.method,
+      toolName,
+      arguments: toolArgs,
+      decision,
+      forwarded: decision.verdict === "allow",
+      timestamp: Date.now()
+    };
+    if (this._onIntercept) {
+      Promise.resolve(this._onIntercept(interceptInfo)).catch(() => {
+      });
+    }
+    this.emit("intercept", interceptInfo);
+    if (decision.verdict === "deny") {
+      this._stats.blockedCalls++;
+      this.sendBlockedResponse(request, decision);
+      if (this._onBlocked) {
+        Promise.resolve(this._onBlocked({
+          method: request.method,
+          toolName,
+          arguments: toolArgs,
+          decision,
+          timestamp: Date.now()
+        })).catch(() => {
+        });
+      }
+      if (this._verbose) {
+        process.stderr.write(`[sovr-mcp-proxy] BLOCKED: ${toolName} \u2014 ${decision.reason}
+`);
+      }
+    } else if (decision.verdict === "escalate") {
+      this._stats.escalatedCalls++;
+      this.sendEscalatedResponse(request, decision);
+      if (this._onEscalated) {
+        Promise.resolve(this._onEscalated({
+          method: request.method,
+          toolName,
+          arguments: toolArgs,
+          decision,
+          timestamp: Date.now()
+        })).catch(() => {
+        });
+      }
+      if (this._verbose) {
+        process.stderr.write(`[sovr-mcp-proxy] ESCALATED: ${toolName} \u2014 ${decision.reason}
+`);
+      }
+    } else {
+      this._stats.allowedCalls++;
+      this.forwardToUpstream(JSON.stringify(request));
+      if (this._verbose) {
+        process.stderr.write(`[sovr-mcp-proxy] ALLOWED: ${toolName} (risk: ${decision.risk_score})
+`);
+      }
+    }
+  }
+  /**
+   * Extract danger signals from tool arguments for rule matching.
+   * Normalizes common patterns across different MCP servers.
+   */
+  extractDangerSignals(toolName, args) {
+    const signals = {};
+    if (toolName.includes("file") || toolName.includes("write") || toolName.includes("read")) {
+      signals.is_file_operation = true;
+      if (args.path) signals.file_path = args.path;
+    }
+    if (toolName.includes("shell") || toolName.includes("exec") || toolName.includes("run")) {
+      signals.is_shell_operation = true;
+      if (args.command) signals.shell_command = args.command;
+    }
+    if (toolName.includes("db") || toolName.includes("sql") || toolName.includes("query")) {
+      signals.is_db_operation = true;
+      if (args.query || args.sql) signals.sql_query = args.query || args.sql;
+    }
+    if (toolName.includes("fetch") || toolName.includes("http") || toolName.includes("request")) {
+      signals.is_network_operation = true;
+      if (args.url) signals.target_url = args.url;
+    }
+    return signals;
+  }
+  sendBlockedResponse(request, decision) {
+    const response = {
+      jsonrpc: "2.0",
+      id: request.id,
+      error: {
+        code: -32001,
+        message: `[SOVR] Action blocked by policy: ${decision.reason}`,
+        data: {
+          sovr_decision_id: decision.decision_id,
+          sovr_verdict: decision.verdict,
+          sovr_risk_score: decision.risk_score,
+          sovr_matched_rules: decision.matched_rules
+        }
+      }
+    };
+    process.stdout.write(JSON.stringify(response) + "\n");
+  }
+  sendEscalatedResponse(request, decision) {
+    const response = {
+      jsonrpc: "2.0",
+      id: request.id,
+      error: {
+        code: -32002,
+        message: `[SOVR] Action requires human approval: ${decision.reason}`,
+        data: {
+          sovr_decision_id: decision.decision_id,
+          sovr_verdict: decision.verdict,
+          sovr_risk_score: decision.risk_score,
+          sovr_matched_rules: decision.matched_rules,
+          sovr_requires_approval: true
+        }
+      }
+    };
+    process.stdout.write(JSON.stringify(response) + "\n");
+  }
+  forwardToUpstream(data) {
+    if (!this.upstream?.stdin) {
+      process.stderr.write("[sovr-mcp-proxy] ERROR: upstream not connected\n");
+      this._stats.upstreamErrors++;
+      return;
+    }
+    this.upstream.stdin.write(data + "\n");
+  }
+};
+async function proxyCli(args) {
+  let upstreamCmd = "";
+  let upstreamArgs = [];
+  let rulesFile = null;
+  let verbose = false;
+  for (let i = 0; i < args.length; i++) {
+    switch (args[i]) {
+      case "--upstream":
+      case "-u": {
+        const parts = (args[++i] ?? "").split(" ");
+        upstreamCmd = parts[0];
+        upstreamArgs = parts.slice(1);
+        break;
+      }
+      case "--rules":
+      case "-r":
+        rulesFile = args[++i];
+        break;
+      case "--verbose":
+      case "-v":
+        verbose = true;
+        break;
+    }
+  }
+  if (!upstreamCmd) {
+    return main();
+  }
+  let customRules = [];
+  if (rulesFile) {
+    const fs = await import("fs");
+    const content = fs.readFileSync(rulesFile, "utf-8");
+    const parsed = JSON.parse(content);
+    customRules = parsed.rules ?? parsed;
+  }
+  const proxy = new McpProxy({
+    upstream: { command: upstreamCmd, args: upstreamArgs },
+    customRules,
+    verbose,
+    onBlocked: (info) => {
+      process.stderr.write(
+        `[BLOCKED] ${info.toolName}: ${info.decision.reason}
+`
+      );
+    },
+    onEscalated: (info) => {
+      process.stderr.write(
+        `[ESCALATED] ${info.toolName}: ${info.decision.reason}
+`
+      );
+    }
+  });
+  await proxy.start();
 }
 export {
+  McpProxy,
   TOOLS,
   VERSION,
   auditLog,
@@ -7244,6 +7560,7 @@ export {
   main,
   parseCommand,
   parseSQL,
+  proxyCli,
   proxyEnabled,
   proxyToolCall,
   proxyToolMap,

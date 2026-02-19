@@ -1,6 +1,6 @@
 {
   "name": "sovr-mcp-proxy",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Transparent MCP Proxy that intercepts all agent tool calls with policy gate-check before forwarding. Superset of sovr-mcp-server.",
   "keywords": [
     "mcp",
@@ -42,6 +42,7 @@
   },
   "mcpName": "io.github.xie38388/sovr-proxy",
   "devDependencies": {
+    "@types/node": "^25.3.0",
     "tsup": "^8.5.1",
     "tsx": "^4.0.0",
     "typescript": "^5.9.3"
